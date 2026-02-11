@@ -48,7 +48,7 @@ else:
 
                     # 2. Trigger n8n (This must be INSIDE the button block)
                     st.info("🔄 Sending plan to n8n for email distribution...")
-                    n8n_webhook_url = "https://YOUR_N8N_URL_HERE" # Replace with your real URL
+                    n8n_webhook_url = "https://abi2026.app.n8n.cloud/webhook/3d057d07-0dcd-4bd3-8c92-f498b4411feb" # Replace with your real URL
                     
                     try:
                         with open("Final_POC_Schedule.xlsx", "rb") as f:
