@@ -3,7 +3,7 @@ import pandas as pd
 import step1_ingest
 import step2_optimizer
 import os
-import requests # Moved to the top for clean code
+import requests
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Zestflow AI Scheduler", layout="wide")
@@ -40,15 +40,15 @@ else:
                 f.write(uploaded_file.getbuffer())
             
             if st.button("🚀 Run AI Optimizer"):
-                with st.spinner("Processing 1000+ orders..."):
-                    # 1. Run the Brain
+                with st.spinner("Processing orders and cleaning data..."):
+                    # 1. Run the local processing scripts
                     step1_ingest.run_ingest()
                     step2_optimizer.run_optimizer()
                     st.success("Schedule Generated Successfully!")
 
-                    # 2. Trigger n8n (This must be INSIDE the button block)
-                    st.info("🔄 Sending plan to n8n for email distribution...")
-                    n8n_webhook_url = "https://abi2026.app.n8n.cloud/webhook/process-schedule" # Replace with your real URL
+                    # 2. Trigger the n8n Cloud Webhook
+                    st.info("🔄 Sending final plan to n8n for email distribution...")
+                    n8n_webhook_url = "https://abi2026.app.n8n.cloud/webhook/process-schedule"
                     
                     try:
                         with open("Final_POC_Schedule.xlsx", "rb") as f:
@@ -56,13 +56,13 @@ else:
                             response = requests.post(n8n_webhook_url, files=files)
                             
                         if response.status_code == 200:
-                            st.success("✅ n8n Notified! Emails are being sent.")
+                            st.success("✅ n8n Notified! Check your email for the schedule.")
                         else:
-                            st.error(f"⚠️ n8n returned error code: {response.status_code}")
+                            st.error(f"⚠️ Connection Refused: n8n returned error {response.status_code}")
                     except Exception as e:
-                        st.error(f"❌ Connection failed: {str(e)}")
+                        st.error(f"❌ Network Error: Could not reach n8n. {str(e)}")
 
-    # PAGE 2: DASHBOARD
+    # PAGE 2: DASHBOARD (Current Results)
     elif page == "Plan Dashboard":
         st.header("📊 Current Production Plan")
         if os.path.exists("Final_POC_Schedule.xlsx"):
@@ -73,15 +73,4 @@ else:
         else:
             st.warning("No plan found. Please upload data first.")
 
-    # PAGE 3: AI CHAT
-    elif page == "AI Planner Chat":
-        st.header("🤖 AI Planner Assistant")
-        if os.path.exists("cleaned_production_data.csv"):
-            user_question = st.text_input("Ask about worker assignments or bottlenecks:")
-            if user_question:
-                if "worker" in user_question.lower() or "team" in user_question.lower():
-                    st.write("🔍 **AI Analysis:** Assignments are based on 'Assigned_Team' data to ensure shift continuity.")
-                elif "why" in user_question.lower():
-                    st.write("🔍 **AI Analysis:** Optimization prioritized the 45-min changeover rule to maximize uptime.")
-        else:
-            st.error("Please generate a plan first.")
+    # PAGE 3: AI
