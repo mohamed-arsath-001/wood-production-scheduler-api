@@ -1,5 +1,5 @@
-flask
+streamlit
 pandas
 openpyxl
+requests
 gunicorn
-ortools
