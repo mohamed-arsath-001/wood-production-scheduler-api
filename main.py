@@ -20,9 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load Master DB
+# --- LOAD MASTER DATABASE ---
 history_df = pd.DataFrame() 
-if os.path.exists("4.API Data.xlsx"):
+if os.path.exists("API Data.xlsx"):
     try: history_df = pd.read_excel("API Data.xlsx")
     except: pass
 elif os.path.exists("4. API Data.xlsx"):
@@ -43,8 +43,9 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
                 else: df = pd.read_excel(io.BytesIO(content))
             except: continue 
 
+            # Step 1: Ingest & Clean
             cleaned_df = step1_ingest.standardize_columns(df)
-            cleaned_df['Source_File'] = filename # Tagging filename is crucial for site detection
+            cleaned_df['Source_File'] = filename 
             combined_data.append(cleaned_df)
 
         if not combined_data:
@@ -52,24 +53,24 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
 
         master_df = pd.concat(combined_data, ignore_index=True)
 
-        # Run Optimizer
+        # Step 2: Run AI Optimizer (With Real Names & Smart Matching)
         optimized_master = step2_optimizer.run_optimizer(master_df, history_df)
 
-        # --- GENERATE EXCEL WITH SPECIFIC TABS ---
+        # --- STEP 3: GENERATE MULTI-SHEET EXCEL FILE ---
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             
-            # 1. DASHBOARD SHEET
+            # TAB 1: DASHBOARD
             total_orders = len(optimized_master)
             total_units = optimized_master['Qty'].sum() if 'Qty' in optimized_master else 0
             
             dashboard_data = [
-                {'Metric': 'ZESTFLOW DASHBOARD', 'Value': ''},
-                {'Metric': '-----------------', 'Value': '---'},
-                {'Metric': 'Total Orders', 'Value': total_orders},
-                {'Metric': 'Total Units', 'Value': total_units},
+                {'Metric': 'ZESTFLOW PILOT DASHBOARD', 'Value': ''},
+                {'Metric': '---------------------------', 'Value': '---'},
+                {'Metric': 'Total Orders Scheduled', 'Value': total_orders},
+                {'Metric': 'Total Units Produced', 'Value': total_units},
                 {'Metric': '', 'Value': ''},
-                {'Metric': 'BREAKDOWN BY SITE', 'Value': ''}
+                {'Metric': 'BATCHES PER SITE', 'Value': ''}
             ]
             
             if 'Site' in optimized_master.columns:
@@ -79,25 +80,28 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             
             pd.DataFrame(dashboard_data).to_excel(writer, index=False, sheet_name='Dashboard')
 
-            # 2. FACTORY SHEETS (Forced Creation)
-            target_factories = ['Boksburg', 'Piet Retief', 'Ugie']
+            # TAB 2, 3, 4: FACTORY SHEETS
+            # We filter the master list and save to separate tabs
+            factories = ['Boksburg', 'Piet Retief', 'Ugie']
             
-            for factory in target_factories:
+            for factory in factories:
                 if 'Site' in optimized_master.columns:
-                    # Filter for this factory
+                    # Filter data for this specific factory
                     sheet_data = optimized_master[optimized_master['Site'] == factory]
-                    # Drop helper columns to keep it clean
-                    sheet_data = sheet_data.drop(columns=['Source_File'], errors='ignore')
+                    
+                    # Sort by Date/Time for readability
+                    if 'Start_Time' in sheet_data.columns:
+                        sheet_data = sheet_data.sort_values('Start_Time')
                 else:
-                    sheet_data = pd.DataFrame() # Empty sheet
+                    sheet_data = pd.DataFrame() 
                 
-                # Write to Excel (Sheet exists even if empty)
+                # Write to Excel Tab
                 sheet_data.to_excel(writer, index=False, sheet_name=factory)
 
         output.seek(0)
 
-        # --- SEND TO N8N ---
-        # Updated URL
+        # --- STEP 4: SEND EXCEL FILE TO N8N ---
+        # This sends the .xlsx file (which supports sheets) instead of a CSV
         n8n_url = "https://arsath26.app.n8n.cloud/webhook/process-schedule"
         files_payload = {'data': ('Optimized_Schedule.xlsx', output, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
         
@@ -108,13 +112,15 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
         except:
             n8n_status = "Email Failed"
 
-        # --- RETURN JSON ---
-        result_json = optimized_master.head(100).fillna("").to_dict(orient="records")
+        # --- STEP 5: RETURN JSON PREVIEW ---
+        # The frontend still gets JSON, but the file sent to N8N is the multi-sheet Excel
+        result_json = optimized_master.head(50).fillna("").to_dict(orient="records")
         
         return {
             "status": "success",
             "files_processed": len(files),
             "n8n_delivery": n8n_status,
+            "message": "Excel file with 4 sheets created.",
             "data": result_json
         }
 
