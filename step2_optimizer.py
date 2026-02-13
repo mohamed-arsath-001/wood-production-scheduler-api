@@ -1,127 +1,117 @@
 import pandas as pd
 from datetime import datetime, timedelta
-import re
 
-def train_model_from_history(history_df):
+def train_performance_model(history_df):
     """
-    Learns Machine Speeds and Worker Rosters from the Master Database.
+    Ranks workers by speed for every Machine + Product combination 
+    based on exact names in the database.
     """
-    knowledge_base = {
-        'machine_speeds': {},  # Avg cycle time per machine
-        'worker_roster': {},   # List of real workers per machine
-        'site_defaults': {}    # Default speeds per factory site
-    }
-
+    kb = {'performance_rank': {}, 'fallback_rank': {}}
     if history_df is None or history_df.empty:
-        return knowledge_base
+        return kb
 
-    # 1. LEARN SPEEDS AND WORKERS
-    # Mapping columns: stationName -> Machine, cycleTimePerOneUnit(sec) -> Speed, operatorTeam -> Worker
-    if 'stationName' in history_df.columns:
-        # Clean the speeds
-        if 'cycleTimePerOneUnit(sec)' in history_df.columns:
-            valid_speeds = history_df[history_df['cycleTimePerOneUnit(sec)'] > 0]
-            knowledge_base['machine_speeds'] = valid_speeds.groupby('stationName')['cycleTimePerOneUnit(sec)'].mean().to_dict()
+    if all(x in history_df.columns for x in ['stationName', 'productName', 'operatorTeam', 'cycleTimePerOneUnit(sec)']):
+        history_df['cycleTimePerOneUnit(sec)'] = pd.to_numeric(history_df['cycleTimePerOneUnit(sec)'], errors='coerce')
         
-        # Clean the roster
-        if 'operatorTeam' in history_df.columns:
-            roster = history_df.groupby('stationName')['operatorTeam'].unique().to_dict()
-            knowledge_base['worker_roster'] = {k: [str(x) for x in v if str(x) != 'nan'] for k, v in roster.items()}
+        # Rank by lowest cycle time (fastest first)
+        perf = history_df.groupby(['stationName', 'productName', 'operatorTeam'])['cycleTimePerOneUnit(sec)'].mean().reset_index()
+        perf = perf.sort_values('cycleTimePerOneUnit(sec)')
+        
+        for _, row in perf.iterrows():
+            key = (row['stationName'], row['productName'])
+            if key not in kb['performance_rank']: kb['performance_rank'][key] = []
+            kb['performance_rank'][key].append({'name': row['operatorTeam'], 'speed': row['cycleTimePerOneUnit(sec)']})
 
-    # 2. LEARN SITE DEFAULTS (Fallback if specific machine speed is missing)
-    if 'factoryName' in history_df.columns and 'cycleTimePerOneUnit(sec)' in history_df.columns:
-        site_avg = history_df.groupby('factoryName')['cycleTimePerOneUnit(sec)'].mean().to_dict()
-        knowledge_base['site_defaults'] = site_avg
-
-    return knowledge_base
+        # Fallback: Best workers per Machine in general
+        fallback = history_df.groupby(['stationName', 'operatorTeam'])['cycleTimePerOneUnit(sec)'].mean().reset_index()
+        fallback = fallback.sort_values('cycleTimePerOneUnit(sec)')
+        for _, row in fallback.iterrows():
+            if row['stationName'] not in kb['fallback_rank']: kb['fallback_rank'][row['stationName']] = []
+            kb['fallback_rank'][row['stationName']].append({'name': row['operatorTeam'], 'speed': row['cycleTimePerOneUnit(sec)']})
+    return kb
 
 def run_optimizer(df, history_df=None):
     """
-    AI-Powered Optimizer:
-    - Calibrates using historical data for real speeds and workers.
-    - Site detection for Boksburg, Piet Retief, and Ugie.
-    - Generates realistic Start/End times.
+    Weekly AI Planner:
+    - Starts the schedule on the next Monday.
+    - Sorts by Machine for contiguous processing.
+    - Assigns workers based on direct machine name matches in the DB.
     """
-    brain = train_model_from_history(history_df)
+    brain = train_performance_model(history_df)
+    machine_clocks = {}
+    schedule = []
     
-    # --- A. SITE DETECTION ---
+    # --- WEEKLY START LOGIC ---
+    # Find the next Monday at 06:00 AM
+    today = datetime.now()
+    days_ahead = 0 - today.weekday()
+    if days_ahead <= 0: days_ahead += 7 
+    start_base = (today + timedelta(days=days_ahead)).replace(hour=6, minute=0, second=0, microsecond=0)
+
+    # Site Detection for sheet organization
     def detect_site(row):
-        machine = str(row.get('Machine', '')).upper()
-        source = str(row.get('Source_File', '')).upper()
-        if 'BXB' in source or 'BXB' in machine: return 'Boksburg'
-        if 'PRF' in source or 'PRF' in machine: return 'Piet Retief'
-        if 'UGI' in source or 'UGI' in machine: return 'Ugie'
-        return 'Unknown'
+        m, s = str(row.get('Machine', '')).upper(), str(row.get('Source_File', '')).upper()
+        if 'BXB' in s or 'BXB' in m: return 'Boksburg'
+        if 'PRF' in s or 'PRF' in m: return 'Piet Retief'
+        if 'UGI' in s or 'UGI' in m: return 'Ugie'
+        return 'Boksburg'
 
     df['Site'] = df.apply(detect_site, axis=1)
-    df = df.sort_values(by=['Site', 'Machine', 'Product'])
     
-    schedule = []
-    machine_clocks = {}
-    start_base = datetime.now().replace(hour=6, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    # --- SORT BY MACHINE ---
+    # Sorting by machine ensures that the schedule for a single machine 
+    # flows correctly from one order to the next.
+    df = df.sort_values(by=['Site', 'Machine'])
 
     for index, row in df.iterrows():
-        machine = str(row.get('Machine', 'Unknown'))
-        qty = pd.to_numeric(row.get('Qty', 0), errors='coerce')
-        site = row.get('Site', 'Unknown')
-        product = row.get('Product', 'Unknown')
+        machine = str(row['Machine'])
+        product = str(row['Product'])
+        qty = row['Qty']
 
-        # --- B. AI DURATION CALCULATION ---
-        # Look for machine speed in DB. 
-        # Note: Plan names (BXBF01) might differ from DB names (BXB_MFB_1).
-        # We use fuzzy matching to find the closest match in the DB.
-        cycle_time = 25 # Default: 25 seconds per unit
+        # AI PERFORMANCE ASSIGNMENT (Direct Match)
+        # 1. Try specific expert match
+        experts = brain['performance_rank'].get((machine, product), [])
+        # 2. Try general machine expert match
+        if not experts:
+            experts = brain['fallback_rank'].get(machine, [])
         
-        # Try to find a speed match in the brain
-        for db_machine, speed in brain['machine_speeds'].items():
-            if str(db_machine).replace("_","") in machine.replace("_",""):
-                cycle_time = speed
-                break
-        
-        # If no machine match, try Site default
-        if cycle_time == 25:
-            cycle_time = brain['site_defaults'].get(site, 25)
+        assigned_worker = "Standard Team"
+        calibrated_speed = 25 # Default seconds per unit
 
-        # Calc duration in minutes (Qty * Seconds / 60)
-        duration_mins = max(15, int((qty * cycle_time) / 60))
+        if experts:
+            # Assign the #1 performer for this specific machine
+            assigned_worker = experts[0]['name']
+            calibrated_speed = experts[0]['speed']
 
-        # --- C. SHIFT & TIME LOGIC ---
+        duration_mins = max(15, int((qty * calibrated_speed) / 60))
+
+        # Scheduling
         if machine not in machine_clocks:
-            machine_clocks[machine] = {'time': start_base, 'last_product': None}
+            machine_clocks[machine] = start_base
         
-        current_time = machine_clocks[machine]['time']
+        start_time = machine_clocks[machine]
         
-        # Add 45-min setup if product changes
-        if machine_clocks[machine]['last_product'] and machine_clocks[machine]['last_product'] != product:
-            current_time += timedelta(minutes=45)
+        # Add 45-min setup time if product changes on the same machine
+        if index > 0 and df.iloc[index-1]['Machine'] == machine and df.iloc[index-1]['Product'] != product:
+             start_time += timedelta(minutes=45)
 
-        start_time = current_time
         end_time = start_time + timedelta(minutes=duration_mins)
+        machine_clocks[machine] = end_time
 
-        # --- D. AI WORKER ASSIGNMENT ---
-        # Look for real names from the DB
-        real_workers = []
-        for db_machine, workers in brain['worker_roster'].items():
-            if str(db_machine).replace("_","") in machine.replace("_",""):
-                real_workers = workers
-                break
-        
-        if real_workers:
-            # Cycle through real names
-            assigned_team = real_workers[index % len(real_workers)]
-        else:
-            # Fallback Team Names
-            assigned_team = f"Team {site} { (index % 3) + 1 }"
-
-        # Build final row
+        # Save results with Weekday and Dates
+        row['Assigned_Team'] = assigned_worker
+        row['Planned_Day'] = start_time.strftime("%A (%b %d)") 
         row['Start_Time'] = start_time.strftime("%Y-%m-%d %H:%M")
         row['End_Time'] = end_time.strftime("%Y-%m-%d %H:%M")
         row['Duration_Mins'] = duration_mins
-        row['Assigned_Team'] = assigned_team
-        row['Shift'] = "Morning" if 6 <= start_time.hour < 14 else "Afternoon" if 14 <= start_time.hour < 22 else "Night"
-
+        
+        # Shift Logic
+        hour = start_time.hour
+        if 6 <= hour < 14: shift = "Morning"
+        elif 14 <= hour < 22: shift = "Afternoon"
+        else: shift = "Night"
+        row['Shift'] = shift
+        
         schedule.append(row)
-        machine_clocks[machine]['time'] = end_time
-        machine_clocks[machine]['last_product'] = product
 
     return pd.DataFrame(schedule)
