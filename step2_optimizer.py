@@ -1,110 +1,125 @@
 import pandas as pd
 from datetime import datetime, timedelta
+import re
 
-# --- A. THE LEARNING LAYER (Reads your Master DB) ---
 def train_model_from_history(history_df):
     """
-    Learns Machine Speeds and Worker Rosters from the 'API Data.xlsx' file.
+    Learns Machine Speeds and Worker Rosters from the Master Database.
     """
     knowledge_base = {
-        'machine_speeds': {},
-        'worker_roster': {}
+        'machine_speeds': {},  # Avg cycle time per machine
+        'worker_roster': {},   # List of real workers per machine
+        'site_defaults': {}    # Default speeds per factory site
     }
 
     if history_df is None or history_df.empty:
         return knowledge_base
 
-    # 1. LEARN SPEEDS
-    if 'stationName' in history_df.columns and 'cycleTimePerOneUnit(sec)' in history_df.columns:
-        valid_rows = history_df[history_df['cycleTimePerOneUnit(sec)'] > 0]
-        avg_speed_machine = valid_rows.groupby('stationName')['cycleTimePerOneUnit(sec)'].mean().to_dict()
-        knowledge_base['machine_speeds'] = avg_speed_machine
+    # 1. LEARN SPEEDS AND WORKERS
+    # Mapping columns: stationName -> Machine, cycleTimePerOneUnit(sec) -> Speed, operatorTeam -> Worker
+    if 'stationName' in history_df.columns:
+        # Clean the speeds
+        if 'cycleTimePerOneUnit(sec)' in history_df.columns:
+            valid_speeds = history_df[history_df['cycleTimePerOneUnit(sec)'] > 0]
+            knowledge_base['machine_speeds'] = valid_speeds.groupby('stationName')['cycleTimePerOneUnit(sec)'].mean().to_dict()
+        
+        # Clean the roster
+        if 'operatorTeam' in history_df.columns:
+            roster = history_df.groupby('stationName')['operatorTeam'].unique().to_dict()
+            knowledge_base['worker_roster'] = {k: [str(x) for x in v if str(x) != 'nan'] for k, v in roster.items()}
 
-    # 2. LEARN WORKERS
-    if 'stationName' in history_df.columns and 'operatorTeam' in history_df.columns:
-        roster_groups = history_df.groupby('stationName')['operatorTeam'].unique().to_dict()
-        clean_roster = {k: [x for x in v if str(x) != 'nan'] for k, v in roster_groups.items()}
-        knowledge_base['worker_roster'] = clean_roster
+    # 2. LEARN SITE DEFAULTS (Fallback if specific machine speed is missing)
+    if 'factoryName' in history_df.columns and 'cycleTimePerOneUnit(sec)' in history_df.columns:
+        site_avg = history_df.groupby('factoryName')['cycleTimePerOneUnit(sec)'].mean().to_dict()
+        knowledge_base['site_defaults'] = site_avg
 
     return knowledge_base
 
-# --- B. THE OPTIMIZER (Uses the Knowledge) ---
 def run_optimizer(df, history_df=None):
-    
+    """
+    AI-Powered Optimizer:
+    - Calibrates using historical data for real speeds and workers.
+    - Site detection for Boksburg, Piet Retief, and Ugie.
+    - Generates realistic Start/End times.
+    """
     brain = train_model_from_history(history_df)
     
-    # --- SITE DETECTION LOGIC (The Fix) ---
+    # --- A. SITE DETECTION ---
     def detect_site(row):
         machine = str(row.get('Machine', '')).upper()
         source = str(row.get('Source_File', '')).upper()
-        
-        # Priority: Check Filename first, then Machine Code
-        if 'BXB' in source or 'BOKSBURG' in source or 'BXB' in machine:
-            return 'Boksburg'
-        elif 'PRF' in source or 'PIET' in source or 'PRF' in machine:
-            return 'Piet Retief'
-        elif 'UGI' in source or 'UGIE' in source or 'UGI' in machine:
-            return 'Ugie'
-        elif 'MKD' in source or 'MKHONDO' in source or 'MKD' in machine:
-            return 'Mkhondo'
-        else:
-            return 'Unknown_Site'
+        if 'BXB' in source or 'BXB' in machine: return 'Boksburg'
+        if 'PRF' in source or 'PRF' in machine: return 'Piet Retief'
+        if 'UGI' in source or 'UGI' in machine: return 'Ugie'
+        return 'Unknown'
 
     df['Site'] = df.apply(detect_site, axis=1)
-    
-    # Sort
     df = df.sort_values(by=['Site', 'Machine', 'Product'])
     
     schedule = []
     machine_clocks = {}
-    
-    # Start: Tomorrow 06:00
     start_base = datetime.now().replace(hour=6, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
     for index, row in df.iterrows():
-        machine = row.get('Machine', 'Unknown')
-        product = row.get('Product', 'Unknown')
+        machine = str(row.get('Machine', 'Unknown'))
         qty = pd.to_numeric(row.get('Qty', 0), errors='coerce')
+        site = row.get('Site', 'Unknown')
+        product = row.get('Product', 'Unknown')
+
+        # --- B. AI DURATION CALCULATION ---
+        # Look for machine speed in DB. 
+        # Note: Plan names (BXBF01) might differ from DB names (BXB_MFB_1).
+        # We use fuzzy matching to find the closest match in the DB.
+        cycle_time = 25 # Default: 25 seconds per unit
         
+        # Try to find a speed match in the brain
+        for db_machine, speed in brain['machine_speeds'].items():
+            if str(db_machine).replace("_","") in machine.replace("_",""):
+                cycle_time = speed
+                break
+        
+        # If no machine match, try Site default
+        if cycle_time == 25:
+            cycle_time = brain['site_defaults'].get(site, 25)
+
+        # Calc duration in minutes (Qty * Seconds / 60)
+        duration_mins = max(15, int((qty * cycle_time) / 60))
+
+        # --- C. SHIFT & TIME LOGIC ---
         if machine not in machine_clocks:
             machine_clocks[machine] = {'time': start_base, 'last_product': None}
-            
-        current_clock = machine_clocks[machine]['time']
-        last_product = machine_clocks[machine]['last_product']
         
-        # Intelligent Speed
-        real_cycle_time_sec = brain['machine_speeds'].get(machine, 30) 
-        duration_mins = (qty * real_cycle_time_sec) / 60
-        duration_mins = int(duration_mins * 1.1) 
-        if duration_mins < 5: duration_mins = 5
+        current_time = machine_clocks[machine]['time']
+        
+        # Add 45-min setup if product changes
+        if machine_clocks[machine]['last_product'] and machine_clocks[machine]['last_product'] != product:
+            current_time += timedelta(minutes=45)
 
-        # Setup Time (45 mins)
-        if last_product and product != last_product:
-            current_clock += timedelta(minutes=45)
-
-        start_time = current_clock
+        start_time = current_time
         end_time = start_time + timedelta(minutes=duration_mins)
 
-        # Worker Assignment
-        possible_workers = brain['worker_roster'].get(machine, ['Unassigned Team'])
-        if not possible_workers: possible_workers = ['Standard Team']
+        # --- D. AI WORKER ASSIGNMENT ---
+        # Look for real names from the DB
+        real_workers = []
+        for db_machine, workers in brain['worker_roster'].items():
+            if str(db_machine).replace("_","") in machine.replace("_",""):
+                real_workers = workers
+                break
         
-        worker_idx = start_time.hour % len(possible_workers)
-        assigned_worker = possible_workers[worker_idx]
+        if real_workers:
+            # Cycle through real names
+            assigned_team = real_workers[index % len(real_workers)]
+        else:
+            # Fallback Team Names
+            assigned_team = f"Team {site} { (index % 3) + 1 }"
 
-        # Shift
-        hour = start_time.hour
-        if 6 <= hour < 14: shift = "Morning"
-        elif 14 <= hour < 18: shift = "Afternoon"
-        elif 18 <= hour < 22: shift = "Evening"
-        else: shift = "Night"
-
+        # Build final row
         row['Start_Time'] = start_time.strftime("%Y-%m-%d %H:%M")
         row['End_Time'] = end_time.strftime("%Y-%m-%d %H:%M")
         row['Duration_Mins'] = duration_mins
-        row['Assigned_Team'] = assigned_worker
-        row['Shift'] = shift
-        
+        row['Assigned_Team'] = assigned_team
+        row['Shift'] = "Morning" if 6 <= start_time.hour < 14 else "Afternoon" if 14 <= start_time.hour < 22 else "Night"
+
         schedule.append(row)
         machine_clocks[machine]['time'] = end_time
         machine_clocks[machine]['last_product'] = product
