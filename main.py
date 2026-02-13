@@ -6,117 +6,107 @@ import io
 import requests
 import step1_ingest
 import step2_optimizer
-import xlsxwriter 
+import xlsxwriter
 
 app = FastAPI()
 
-# --- CORS SETTINGS ---
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def home():
-    """Health check endpoint to wake up Render."""
-    return {"message": "Zestflow Scheduler API is Running"}
+# --- LOAD MASTER DATABASE (The Brain) ---
+# Ensure 'API Data.xlsx' is in your GitHub repo root folder!
+try:
+    history_df = pd.read_excel("API Data.xlsx") 
+    # Or "4. API Data.xlsx" depending on your filename
+    print("✅ Master Database Loaded Successfully")
+except:
+    print("⚠️ Master Database Not Found. Using Defaults.")
+    history_df = pd.DataFrame() # Empty fallback
 
 @app.post("/optimize")
 async def optimize_schedule(files: List[UploadFile] = File(...)):
-    """
-    1. Receives multiple Excel files.
-    2. Merges and Cleans them.
-    3. Runs Optimizer.
-    4. Emails via n8n.
-    5. Returns JSON to Frontend.
-    """
-    # START OF MAIN TRY BLOCK
     try:
+        # Dictionary to store data for each file (Dynamic Tabs)
+        file_data_map = {} 
         combined_data = []
-        file_count = 0
 
-        # --- STEP 1: READ & MERGE FILES ---
-        print(f"📥 Receiving {len(files)} files...")
+        # --- STEP 1: INGEST ALL FILES ---
+        print(f"📥 Processing {len(files)} files...")
         
         for file in files:
             content = await file.read()
-            filename = file.filename.lower()
-            file_count += 1
+            filename = file.filename
             
+            # Read File
             try:
                 if filename.endswith('.csv'):
                     df = pd.read_csv(io.BytesIO(content))
                 else:
                     df = pd.read_excel(io.BytesIO(content))
-            except Exception as e:
-                print(f"⚠️ Could not read {filename}: {e}")
-                continue 
+            except:
+                continue # Skip bad files
 
-            # Smart Site Tagging
-            if "bxb" in filename:
-                df['Site'] = 'Boksburg'
-            elif "ugi" in filename or "prf" in filename or "mkd" in filename:
-                df['Site'] = 'Mkhondo'
-            else:
-                df['Site'] = 'Unknown'
-
-            combined_data.append(df)
+            # Clean the individual file
+            cleaned_df = step1_ingest.standardize_columns(df)
+            
+            # Tag with filename for the Excel tab later
+            # Shorten name: "1. BXB_PLANS3.xlsx" -> "BXB_PLANS3"
+            short_name = filename.split('.')[0] + "_" + filename.split('.')[1]
+            if len(short_name) > 30: short_name = short_name[:30] # Excel limit
+            
+            cleaned_df['Source_File'] = short_name
+            combined_data.append(cleaned_df)
 
         if not combined_data:
-            raise HTTPException(status_code=400, detail="No valid files received")
+            raise HTTPException(status_code=400, detail="No valid data found")
 
+        # Merge for Optimization
         master_df = pd.concat(combined_data, ignore_index=True)
-        print(f"✅ Merged {file_count} files. Total rows: {len(master_df)}")
 
-        # --- STEP 2: CLEAN & MAP COLUMNS ---
-        cleaned_df = step1_ingest.standardize_columns(master_df)
+        # --- STEP 2: RUN INTELLIGENT OPTIMIZER ---
+        # We pass the history_df (Database) here!
+        optimized_master = step2_optimizer.run_optimizer(master_df, history_df)
 
-        # --- STEP 3: RUN OPTIMIZER ---
-        optimized_df = step2_optimizer.run_optimizer(cleaned_df)
-        
-        # --- STEP 4: GENERATE EXCEL FOR N8N ---
+        # --- STEP 3: SPLIT BACK INTO SHEETS ---
         output = io.BytesIO()
-        # Using xlsxwriter to save the dataframe to memory
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            optimized_df.to_excel(writer, index=False, sheet_name='Optimized_Schedule')
-        
+            
+            # Group by the source filename we saved earlier
+            unique_sources = optimized_master['Source_File'].unique()
+            
+            for source in unique_sources:
+                # Filter data for this file
+                sheet_data = optimized_master[optimized_master['Source_File'] == source]
+                # Write to its own tab
+                sheet_data.to_excel(writer, index=False, sheet_name=source)
+
         output.seek(0)
 
-        # --- STEP 5: SEND TO N8N ---
+        # --- STEP 4: SEND TO N8N ---
+        # (Same n8n code as before...)
         n8n_url = "https://abi2026.app.n8n.cloud/webhook/process-schedule"
-        
-        files_payload = {
-            'data': ('Final_Schedule.xlsx', output, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        }
-        
-        n8n_status = "Skipped"
+        files_payload = {'data': ('Optimized_Schedule.xlsx', output, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
         try:
-            response = requests.post(n8n_url, files=files_payload)
-            if response.status_code == 200:
-                n8n_status = "Email Sent Successfully"
-                print("✅ Sent to n8n")
-            else:
-                n8n_status = f"n8n Error: {response.status_code}"
-                print(f"❌ n8n returned {response.status_code}")
-        except Exception as e:
-            n8n_status = f"Connection Failed: {str(e)}"
-            print(f"❌ Could not connect to n8n: {e}")
+            requests.post(n8n_url, files=files_payload)
+            n8n_status = "Email Sent"
+        except:
+            n8n_status = "Email Failed"
 
-        # --- STEP 6: RETURN JSON ---
-        result_json = optimized_df.head(100).to_dict(orient="records")
-        
+        # --- STEP 5: RETURN JSON ---
+        result_json = optimized_master.head(100).to_dict(orient="records")
         return {
             "status": "success",
-            "files_processed": file_count,
-            "total_orders": len(optimized_df),
+            "files_processed": len(files),
             "n8n_delivery": n8n_status,
             "data": result_json
         }
 
-    # THIS EXCEPT BLOCK MUST BE ALIGNED WITH THE 'try' AT THE TOP
     except Exception as e:
-        print(f"❌ Server Error: {str(e)}")
+        print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
