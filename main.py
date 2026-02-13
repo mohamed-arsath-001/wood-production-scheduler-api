@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from typing import List
 import pandas as pd
 import io
@@ -53,24 +54,24 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
 
         master_df = pd.concat(combined_data, ignore_index=True)
 
-        # Step 2: Run AI Optimizer (With Real Names & Smart Matching)
+        # Step 2: Run AI Optimizer
         optimized_master = step2_optimizer.run_optimizer(master_df, history_df)
 
-        # --- STEP 3: GENERATE MULTI-SHEET EXCEL FILE ---
+        # --- STEP 3: CREATE MULTI-SHEET EXCEL FILE ---
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             
-            # TAB 1: DASHBOARD
+            # SHEET 1: DASHBOARD
             total_orders = len(optimized_master)
             total_units = optimized_master['Qty'].sum() if 'Qty' in optimized_master else 0
             
             dashboard_data = [
-                {'Metric': 'ZESTFLOW PILOT DASHBOARD', 'Value': ''},
+                {'Metric': 'ZESTFLOW PRODUCTION PLAN', 'Value': ''},
                 {'Metric': '---------------------------', 'Value': '---'},
-                {'Metric': 'Total Orders Scheduled', 'Value': total_orders},
-                {'Metric': 'Total Units Produced', 'Value': total_units},
+                {'Metric': 'Total Orders', 'Value': total_orders},
+                {'Metric': 'Total Units', 'Value': total_units},
                 {'Metric': '', 'Value': ''},
-                {'Metric': 'BATCHES PER SITE', 'Value': ''}
+                {'Metric': 'BREAKDOWN BY FACTORY', 'Value': ''}
             ]
             
             if 'Site' in optimized_master.columns:
@@ -80,49 +81,40 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             
             pd.DataFrame(dashboard_data).to_excel(writer, index=False, sheet_name='Dashboard')
 
-            # TAB 2, 3, 4: FACTORY SHEETS
-            # We filter the master list and save to separate tabs
-            factories = ['Boksburg', 'Piet Retief', 'Ugie']
-            
-            for factory in factories:
-                if 'Site' in optimized_master.columns:
-                    # Filter data for this specific factory
-                    sheet_data = optimized_master[optimized_master['Site'] == factory]
-                    
-                    # Sort by Date/Time for readability
-                    if 'Start_Time' in sheet_data.columns:
-                        sheet_data = sheet_data.sort_values('Start_Time')
-                else:
-                    sheet_data = pd.DataFrame() 
-                
-                # Write to Excel Tab
-                sheet_data.to_excel(writer, index=False, sheet_name=factory)
+            # SHEET 2: BOKSBURG (Filter by Site)
+            if 'Site' in optimized_master.columns:
+                df_bxb = optimized_master[optimized_master['Site'] == 'Boksburg']
+                df_bxb.to_excel(writer, index=False, sheet_name='Boksburg')
+
+            # SHEET 3: PIET RETIEF
+            if 'Site' in optimized_master.columns:
+                df_prf = optimized_master[optimized_master['Site'] == 'Piet Retief']
+                df_prf.to_excel(writer, index=False, sheet_name='Piet Retief')
+
+            # SHEET 4: UGIE
+            if 'Site' in optimized_master.columns:
+                df_ugi = optimized_master[optimized_master['Site'] == 'Ugie']
+                df_ugi.to_excel(writer, index=False, sheet_name='Ugie')
 
         output.seek(0)
 
-        # --- STEP 4: SEND EXCEL FILE TO N8N ---
-        # This sends the .xlsx file (which supports sheets) instead of a CSV
+        # --- STEP 4: SEND EXCEL TO N8N (EMAIL) ---
         n8n_url = "https://arsath26.app.n8n.cloud/webhook/process-schedule"
-        files_payload = {'data': ('Optimized_Schedule.xlsx', output, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
+        files_payload = {'data': ('Production_Plan.xlsx', output.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
         
-        n8n_status = "Skipped"
         try:
             requests.post(n8n_url, files=files_payload)
-            n8n_status = "Email Sent"
-        except:
-            n8n_status = "Email Failed"
+            print("✅ Excel file sent to N8N")
+        except Exception as e:
+            print(f"❌ Failed to send to N8N: {e}")
 
-        # --- STEP 5: RETURN JSON PREVIEW ---
-        # The frontend still gets JSON, but the file sent to N8N is the multi-sheet Excel
-        result_json = optimized_master.head(50).fillna("").to_dict(orient="records")
-        
-        return {
-            "status": "success",
-            "files_processed": len(files),
-            "n8n_delivery": n8n_status,
-            "message": "Excel file with 4 sheets created.",
-            "data": result_json
+        # --- STEP 5: ALSO RETURN FILE DIRECTLY TO BROWSER ---
+        # This allows you to verify it immediately without waiting for email
+        output.seek(0)
+        headers = {
+            'Content-Disposition': 'attachment; filename="Production_Plan.xlsx"'
         }
+        return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
     except Exception as e:
         print(f"Server Error: {e}")
