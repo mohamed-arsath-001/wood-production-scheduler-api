@@ -1,60 +1,53 @@
 import pandas as pd
-import os
 
-def run_ingest():
-    print("--- STEP 1: INGESTING DATA (WITH TEAMS) ---")
+def standardize_columns(df):
+    """
+    Standardizes column names from various client Excel formats (BXB, PRF, UGI)
+    into the strict format required by the Zestflow Optimizer.
+    """
     
-    # 1. Load File
-    if os.path.exists("DummyData.xlsx"):
-        df = pd.read_excel("DummyData.xlsx")
-    elif os.path.exists("DummyData.csv"):
-        df = pd.read_csv("DummyData.csv", encoding='latin1', low_memory=False)
-    else:
-        print("❌ Error: No file found.")
-        return
-
-    # 2. SMART MAPPING
+    # 1. CLEAN COLUMN NAMES (Remove spaces, make lowercase for matching)
+    df.columns = [c.strip() for c in df.columns]
     
-    # FACTORY (Site)
-    if 'factoryName' in df.columns: df['Plant'] = df['factoryName']
-    elif 'factory' in df.columns: df['Plant'] = df['factory']
-    else: df['Plant'] = "Unknown_Site"
+    # 2. DEFINE MAPPINGS
+    # Key = The Standard Name we need
+    # Value = List of possible headers in the client's Excel files
+    column_map = {
+        'Order_ID': ['Order', 'Production Order', 'Order No', 'ID'],
+        'Product': ['Item Name', 'Material', 'Description', 'Product Code', 'Item'],
+        'Qty': ['Quantity', 'OrderQty', 'Amount', 'Target Qty', 'Qty'],
+        'Machine': ['WorkCenter', 'Work Center', 'Station', 'Resource', 'Machine Name'],
+        'Assigned_Team': ['Team', 'Worker', 'Operator', 'Personnel']
+    }
 
-    # MACHINE
-    if 'stationName' in df.columns: df['Machine_Name'] = df['stationName']
-    elif 'station' in df.columns: df['Machine_Name'] = df['station']
-    elif 'stationId' in df.columns: df['Machine_Name'] = df['stationId']
-    else: df['Machine_Name'] = "Main_Line"
-
-    # TEAM / WORKER (NEW)
-    if 'operatorTeam' in df.columns: df['Assigned_Team'] = df['operatorTeam']
-    elif 'operator' in df.columns: df['Assigned_Team'] = df['operator']
-    elif 'team' in df.columns: df['Assigned_Team'] = df['team']
-    else: df['Assigned_Team'] = "TBD"
-
-    # PRODUCT & QTY
-    if 'productName' in df.columns: df['productGroupName'] = df['productName']
-    
-    if 'totalQty' not in df.columns:
-        for col in df.columns:
-            if 'qty' in col.lower():
-                df['totalQty'] = df[col]
+    # 3. APPLY MAPPING
+    for standard_col, potential_names in column_map.items():
+        # Check if the standard column already exists
+        if standard_col in df.columns:
+            continue
+            
+        # Look for a match in the potential names
+        for alias in potential_names:
+            # Case-insensitive check
+            match = next((c for c in df.columns if c.lower() == alias.lower()), None)
+            if match:
+                df = df.rename(columns={match: standard_col})
                 break
     
-    # 3. SELECT & CLEAN
-    # Added 'Assigned_Team' to this list
-    required_cols = ['totalQty', 'productGroupName', 'Plant', 'Machine_Name', 'productionOrderNumber', 'Assigned_Team']
+    # 4. DATA SANITIZATION
     
-    for col in required_cols:
-        if col not in df.columns: df[col] = "Unknown"
+    # Fill missing Team (Critical for logic not to crash)
+    if 'Assigned_Team' not in df.columns:
+        df['Assigned_Team'] = 'Unassigned'
+    else:
+        df['Assigned_Team'] = df['Assigned_Team'].fillna('Unassigned')
 
-    clean_df = df[required_cols].copy()
-    
-    clean_df['totalQty'] = pd.to_numeric(clean_df['totalQty'], errors='coerce').fillna(0)
-    clean_df = clean_df[clean_df['totalQty'] > 0]
+    # Ensure Site is present (It should be tagged in main.py, but just in case)
+    if 'Site' not in df.columns:
+        df['Site'] = 'Unknown'
 
-    clean_df.to_csv("cleaned_production_data.csv", index=False)
-    print(f"✅ Data Cleaned. Preserved Teams for {len(clean_df)} orders.")
+    # Filter out Zero Qty or invalid rows
+    if 'Qty' in df.columns:
+        df = df[df['Qty'] > 0]
 
-if __name__ == "__main__":
-    run_ingest()
+    return df
