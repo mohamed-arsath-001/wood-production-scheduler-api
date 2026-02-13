@@ -90,7 +90,7 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
 
         # --- STEP 4: SEND TO N8N ---
         # (Same n8n code as before...)
-        n8n_url = "https://abi2026.app.n8n.cloud/webhook/process-schedule"
+        n8n_url = "https://arsath26.app.n8n.cloud/webhook/process-schedule"
         files_payload = {'data': ('Optimized_Schedule.xlsx', output, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
         try:
             requests.post(n8n_url, files=files_payload)
