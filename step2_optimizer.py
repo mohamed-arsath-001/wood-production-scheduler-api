@@ -1,10 +1,39 @@
 import pandas as pd
 from datetime import datetime, timedelta
 
+def resolve_machine_code(name):
+    """
+    MANUAL MAPPING LAYER:
+    Translates the specific codes from your Excel plans to the Master Database names.
+    """
+    name = str(name).upper().strip()
+    mapping = {
+        # Boksburg Mappings
+        'BXBF01': 'BXB_MFB_1',
+        'BXBF02': 'BXB_MFB_2',
+        'BXBE01': 'BXB_MFB_2', # Assuming E01 is Line 2
+        'BXB321': 'BXB_MFB_1', # Mapping to main line if unknown
+        'BXBRF1': 'BXB_MFB_1',
+        'BXBSX1': 'BXB_MFB_1',
+
+        # Piet Retief (Mkhondo) Mappings
+        'PRFF01': 'MKD_MFB_1',
+        'PRFF02': 'MKD_MFB_2',
+        'PRFE01': 'MKD_MFB_2',
+        'PRF218': 'MKD_MFB_1',
+        'PRFRF1': 'MKD_MFB_1',
+
+        # Ugie Mappings
+        'UGIF01': 'UGI_CONTI_1',
+        'UGI005': 'UGI_CONTI_1',
+        'UGI003': 'UGI_CONTI_1'
+    }
+    # Return the mapped name, or the original if not found
+    return mapping.get(name, name)
+
 def train_performance_model(history_df):
     """
-    Ranks workers by speed for every Machine + Product combination 
-    based on exact names in the database.
+    Ranks workers by speed for every Machine + Product combination.
     """
     kb = {'performance_rank': {}, 'fallback_rank': {}}
     if history_df is None or history_df.empty:
@@ -32,10 +61,7 @@ def train_performance_model(history_df):
 
 def run_optimizer(df, history_df=None):
     """
-    Weekly AI Planner:
-    - Starts the schedule on the next Monday.
-    - Sorts by Machine for contiguous processing.
-    - Assigns workers based on direct machine name matches in the DB.
+    Weekly AI Planner with Manual Mapping
     """
     brain = train_performance_model(history_df)
     machine_clocks = {}
@@ -48,7 +74,7 @@ def run_optimizer(df, history_df=None):
     if days_ahead <= 0: days_ahead += 7 
     start_base = (today + timedelta(days=days_ahead)).replace(hour=6, minute=0, second=0, microsecond=0)
 
-    # Site Detection for sheet organization
+    # Site Detection
     def detect_site(row):
         m, s = str(row.get('Machine', '')).upper(), str(row.get('Source_File', '')).upper()
         if 'BXB' in s or 'BXB' in m: return 'Boksburg'
@@ -59,7 +85,6 @@ def run_optimizer(df, history_df=None):
     df['Site'] = df.apply(detect_site, axis=1)
     
     # --- CRITICAL FIX: RESET INDEX AFTER SORTING ---
-    # Sorting ensures contiguous machine orders. Resetting index ensures the loop works correctly.
     df = df.sort_values(by=['Site', 'Machine']).reset_index(drop=True)
 
     for index, row in df.iterrows():
@@ -67,10 +92,14 @@ def run_optimizer(df, history_df=None):
         product = str(row['Product'])
         qty = row['Qty']
 
-        # AI PERFORMANCE ASSIGNMENT (Direct Match)
-        experts = brain['performance_rank'].get((machine, product), [])
+        # --- MANUAL MAPPING APPLIED HERE ---
+        # 1. Resolve the code (BXBF01 -> BXB_MFB_1)
+        db_machine_name = resolve_machine_code(machine)
+        
+        # 2. AI Performance Lookup using the RESOLVED name
+        experts = brain['performance_rank'].get((db_machine_name, product), [])
         if not experts:
-            experts = brain['fallback_rank'].get(machine, [])
+            experts = brain['fallback_rank'].get(db_machine_name, [])
         
         assigned_worker = "Standard Team"
         calibrated_speed = 25 # Default seconds per unit
@@ -88,8 +117,7 @@ def run_optimizer(df, history_df=None):
         
         start_time = machine_clocks[machine]
         
-        # Add 45-min setup time if product changes on the same machine
-        # Because we reset_index, 'index-1' now correctly refers to the previous row in the sorted list
+        # Setup Time (45 mins) - Using safe index lookup
         if index > 0:
             prev_row = df.iloc[index-1]
             if prev_row['Machine'] == machine and prev_row['Product'] != product:
@@ -103,14 +131,9 @@ def run_optimizer(df, history_df=None):
         row['Planned_Day'] = start_time.strftime("%A (%b %d)") 
         row['Start_Time'] = start_time.strftime("%Y-%m-%d %H:%M")
         row['End_Time'] = end_time.strftime("%Y-%m-%d %H:%M")
+        row['Time_Only'] = start_time.strftime("%H:%M") 
         row['Duration_Mins'] = duration_mins
-        
-        # Shift Logic
-        hour = start_time.hour
-        if 6 <= hour < 14: shift = "Morning"
-        elif 14 <= hour < 22: shift = "Afternoon"
-        else: shift = "Night"
-        row['Shift'] = shift
+        row['Shift'] = "Morning" if 6 <= start_time.hour < 14 else "Afternoon" if 14 <= start_time.hour < 22 else "Night"
         
         schedule.append(row)
 
