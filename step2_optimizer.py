@@ -58,10 +58,9 @@ def run_optimizer(df, history_df=None):
 
     df['Site'] = df.apply(detect_site, axis=1)
     
-    # --- SORT BY MACHINE ---
-    # Sorting by machine ensures that the schedule for a single machine 
-    # flows correctly from one order to the next.
-    df = df.sort_values(by=['Site', 'Machine'])
+    # --- CRITICAL FIX: RESET INDEX AFTER SORTING ---
+    # Sorting ensures contiguous machine orders. Resetting index ensures the loop works correctly.
+    df = df.sort_values(by=['Site', 'Machine']).reset_index(drop=True)
 
     for index, row in df.iterrows():
         machine = str(row['Machine'])
@@ -69,9 +68,7 @@ def run_optimizer(df, history_df=None):
         qty = row['Qty']
 
         # AI PERFORMANCE ASSIGNMENT (Direct Match)
-        # 1. Try specific expert match
         experts = brain['performance_rank'].get((machine, product), [])
-        # 2. Try general machine expert match
         if not experts:
             experts = brain['fallback_rank'].get(machine, [])
         
@@ -79,7 +76,7 @@ def run_optimizer(df, history_df=None):
         calibrated_speed = 25 # Default seconds per unit
 
         if experts:
-            # Assign the #1 performer for this specific machine
+            # Assign the #1 performer
             assigned_worker = experts[0]['name']
             calibrated_speed = experts[0]['speed']
 
@@ -92,13 +89,16 @@ def run_optimizer(df, history_df=None):
         start_time = machine_clocks[machine]
         
         # Add 45-min setup time if product changes on the same machine
-        if index > 0 and df.iloc[index-1]['Machine'] == machine and df.iloc[index-1]['Product'] != product:
-             start_time += timedelta(minutes=45)
+        # Because we reset_index, 'index-1' now correctly refers to the previous row in the sorted list
+        if index > 0:
+            prev_row = df.iloc[index-1]
+            if prev_row['Machine'] == machine and prev_row['Product'] != product:
+                start_time += timedelta(minutes=45)
 
         end_time = start_time + timedelta(minutes=duration_mins)
         machine_clocks[machine] = end_time
 
-        # Save results with Weekday and Dates
+        # Save results
         row['Assigned_Team'] = assigned_worker
         row['Planned_Day'] = start_time.strftime("%A (%b %d)") 
         row['Start_Time'] = start_time.strftime("%Y-%m-%d %H:%M")
