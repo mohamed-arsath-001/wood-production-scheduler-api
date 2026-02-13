@@ -61,7 +61,7 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             
-            # SHEET 1: DASHBOARD
+            # TAB 1: DASHBOARD
             total_orders = len(optimized_master)
             total_units = optimized_master['Qty'].sum() if 'Qty' in optimized_master else 0
             
@@ -81,17 +81,17 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             
             pd.DataFrame(dashboard_data).to_excel(writer, index=False, sheet_name='Dashboard')
 
-            # SHEET 2: BOKSBURG (Filter by Site)
+            # TAB 2: BOKSBURG
             if 'Site' in optimized_master.columns:
                 df_bxb = optimized_master[optimized_master['Site'] == 'Boksburg']
                 df_bxb.to_excel(writer, index=False, sheet_name='Boksburg')
 
-            # SHEET 3: PIET RETIEF
+            # TAB 3: PIET RETIEF
             if 'Site' in optimized_master.columns:
                 df_prf = optimized_master[optimized_master['Site'] == 'Piet Retief']
                 df_prf.to_excel(writer, index=False, sheet_name='Piet Retief')
 
-            # SHEET 4: UGIE
+            # TAB 4: UGIE
             if 'Site' in optimized_master.columns:
                 df_ugi = optimized_master[optimized_master['Site'] == 'Ugie']
                 df_ugi.to_excel(writer, index=False, sheet_name='Ugie')
@@ -108,8 +108,7 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
         except Exception as e:
             print(f"❌ Failed to send to N8N: {e}")
 
-        # --- STEP 5: ALSO RETURN FILE DIRECTLY TO BROWSER ---
-        # This allows you to verify it immediately without waiting for email
+        # --- STEP 5: DIRECT BROWSER DOWNLOAD ---
         output.seek(0)
         headers = {
             'Content-Disposition': 'attachment; filename="Production_Plan.xlsx"'
