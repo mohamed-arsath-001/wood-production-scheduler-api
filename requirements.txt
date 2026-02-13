@@ -2,6 +2,7 @@ fastapi
 uvicorn
 pandas
 openpyxl
-xlsxwriter
-python-multipart
+python-multipart  
 requests
+xlsxwriter
+
