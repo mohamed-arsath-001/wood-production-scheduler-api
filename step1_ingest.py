@@ -4,7 +4,6 @@ import numpy as np
 def standardize_columns(df):
     search_terms = ["planned qty", "item number", "w/h", "station", "stationname", "qty", "material"]
     
-    # Header detection logic
     found_header = False
     current_headers = [str(c).lower().strip() for c in df.columns]
     if any(term in h for h in current_headers for term in search_terms):
@@ -20,6 +19,10 @@ def standardize_columns(df):
 
     df.columns = [str(c).strip() for c in df.columns]
     
+    # --- NEW ADDITION: REMOVE UNNAMED COLUMNS ---
+    # This filters out any 'ghost' columns from the client's Excel files
+    df = df.loc[:, ~df.columns.str.contains('^Unnamed', case=False, na=False)]
+    
     column_map = {
         'Machine': ['W/H', 'WorkCenter', 'Work Center', 'Station', 'Resource'],
         'Product': ['Item Number', 'Item', 'Material', 'Description', 'Product Code'],
@@ -34,12 +37,10 @@ def standardize_columns(df):
                     df = df.rename(columns={match: standard_col})
                     break
     
-    # --- SMART ID & SAFETY NET ---
+    # Generate Smart ID if missing
     if 'Order_ID' not in df.columns:
-        # Generate a unique ID based on Machine and Row Number
         df['Order_ID'] = [f"ORD-{str(m)[:3]}-{i+100}" for i, m in enumerate(df.get('Machine', 'UNK'))]
 
-    if 'Qty' not in df.columns: df['Qty'] = 0
     df['Qty'] = pd.to_numeric(df['Qty'], errors='coerce').fillna(0)
     df = df[df['Qty'] > 0]
 
