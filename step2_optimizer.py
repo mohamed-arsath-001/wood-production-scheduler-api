@@ -20,6 +20,12 @@ def train_performance_model(history_df):
     if history_df is None or history_df.empty: return kb
 
     if all(x in history_df.columns for x in ['stationName', 'productName', 'operatorTeam', 'cycleTimePerOneUnit(sec)']):
+        
+        # --- FIX: REMOVE GHOST WORKERS ---
+        # Filters out dashes, empties, and 'NaN' before the AI learns them
+        invalid_names = ['-', 'NaN', 'None', 'nan', '', ' ']
+        history_df = history_df[~history_df['operatorTeam'].astype(str).str.strip().isin(invalid_names)]
+        
         history_df['cycleTimePerOneUnit(sec)'] = pd.to_numeric(history_df['cycleTimePerOneUnit(sec)'], errors='coerce')
         perf = history_df.groupby(['stationName', 'productName', 'operatorTeam'])['cycleTimePerOneUnit(sec)'].mean().reset_index()
         perf = perf.sort_values('cycleTimePerOneUnit(sec)')
@@ -73,7 +79,7 @@ def run_optimizer(df, history_df=None):
         if not experts: experts = brain['fallback_rank'].get(db_machine_name, [])
         if experts: calibrated_speed = experts[0]['speed']
 
-        # --- FAULT 2 FIX: BATCH SPLITTING ---
+        # --- BATCH SPLITTING ---
         # If duration > 16 hours, split into smaller chunks
         MAX_BATCH_HRS = 16
         units_per_hr = (3600 / calibrated_speed)
@@ -81,6 +87,7 @@ def run_optimizer(df, history_df=None):
         
         # Calculate how many splits we need
         num_splits = math.ceil(total_qty / max_qty_per_batch)
+        if num_splits == 0: num_splits = 1
         
         for i in range(num_splits):
             # Calculate Qty for this sub-batch
@@ -104,8 +111,6 @@ def run_optimizer(df, history_df=None):
                 for expert in experts:
                     w_name = expert['name']
                     # Check if worker is free AND has rested (Fatigue Buffer)
-                    # We assume they need 8 hours rest after a shift, but for simplicity here,
-                    # we just check if they are free at the start time.
                     if worker_clocks.get(w_name, start_base) <= start_time:
                         assigned_worker = w_name
                         calibrated_speed = expert['speed'] # Update speed to expert speed
