@@ -57,6 +57,11 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
         # Step 2: Run AI Optimizer
         optimized_master = step2_optimizer.run_optimizer(master_df, history_df)
 
+        # --- MOVE PRODUCTION LINE COLUMN TO THE FRONT ---
+        if 'Production_Line' in optimized_master.columns:
+            cols = ['Production_Line'] + [c for c in optimized_master.columns if c != 'Production_Line']
+            optimized_master = optimized_master[cols]
+
         # --- STEP 3: CREATE MULTI-SHEET EXCEL FILE ---
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
