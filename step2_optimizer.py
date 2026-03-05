@@ -135,6 +135,34 @@ def run_optimizer(df, history_df=None):
             new_row = row.copy()
             new_row['Qty'] = qty_this_batch
             new_row['Assigned_Team'] = assigned_worker
+            
+            # --- NEW FIX: ADD HUMAN-READABLE PRODUCTION LINE ---
+            ig_code = str(row.get('I/G', '')).upper()
+            machine_code = str(row.get('Machine', '')).upper()
+            desc = str(row.get('Item Description', '')).upper()
+            
+            prod_line = "General Line"
+            
+            # Boksburg Lines
+            if 'BXB' in machine_code:
+                if 'AEB' in ig_code or 'FOIL' in desc: prod_line = "FOIL LINE"
+                elif 'BXB321' in machine_code: prod_line = "MFB_2 LINE"
+                else: prod_line = "MFB_1 LINE"
+            
+            # Piet Retief Lines
+            elif 'PRF' in machine_code:
+                if 'AAA' in ig_code or 'AAD' in ig_code: prod_line = "CHIP LINE"
+                elif 'ADA' in ig_code: prod_line = "MDF LINE"
+                else: prod_line = "MFB_1 LINE"
+            
+            # Ugie Lines
+            elif 'UGI' in machine_code:
+                if 'AAA' in ig_code: prod_line = "CONTI LINE"
+                else: prod_line = "GLS/TXT MFB LINE"
+                
+            new_row['Production_Line'] = prod_line
+            # ---------------------------------------------------
+
             new_row['Planned_Day'] = start_time.strftime("%A (%b %d)") 
             new_row['Start_Time'] = start_time.strftime("%Y-%m-%d %H:%M")
             new_row['End_Time'] = end_time.strftime("%Y-%m-%d %H:%M")
