@@ -1,179 +1,102 @@
 import pandas as pd
 from datetime import datetime, timedelta
-import math
-
-def resolve_machine_code(name):
-    """Translates plan codes to database names."""
-    name = str(name).upper().strip()
-    mapping = {
-        'BXBF01': 'BXB_MFB_1', 'BXBF02': 'BXB_MFB_2',
-        'BXBE01': 'BXB_MFB_2', 'BXB321': 'BXB_MFB_1',
-        'PRFF01': 'MKD_MFB_1', 'PRFF02': 'MKD_MFB_2',
-        'PRFE01': 'MKD_MFB_2', 'PRF218': 'MKD_MFB_1',
-        'UGIF01': 'UGI_CONTI_1', 'UGI005': 'UGI_CONTI_1'
-    }
-    return mapping.get(name, name)
-
-def train_performance_model(history_df):
-    """Ranks workers by speed."""
-    kb = {'performance_rank': {}, 'fallback_rank': {}}
-    if history_df is None or history_df.empty: return kb
-
-    if all(x in history_df.columns for x in ['stationName', 'productName', 'operatorTeam', 'cycleTimePerOneUnit(sec)']):
-        
-        # --- FIX: REMOVE GHOST WORKERS ---
-        # Filters out dashes, empties, and 'NaN' before the AI learns them
-        invalid_names = ['-', 'NaN', 'None', 'nan', '', ' ']
-        history_df = history_df[~history_df['operatorTeam'].astype(str).str.strip().isin(invalid_names)]
-        
-        history_df['cycleTimePerOneUnit(sec)'] = pd.to_numeric(history_df['cycleTimePerOneUnit(sec)'], errors='coerce')
-        perf = history_df.groupby(['stationName', 'productName', 'operatorTeam'])['cycleTimePerOneUnit(sec)'].mean().reset_index()
-        perf = perf.sort_values('cycleTimePerOneUnit(sec)')
-        
-        for _, row in perf.iterrows():
-            key = (row['stationName'], row['productName'])
-            if key not in kb['performance_rank']: kb['performance_rank'][key] = []
-            kb['performance_rank'][key].append({'name': row['operatorTeam'], 'speed': row['cycleTimePerOneUnit(sec)']})
-
-        fallback = history_df.groupby(['stationName', 'operatorTeam'])['cycleTimePerOneUnit(sec)'].mean().reset_index()
-        fallback = fallback.sort_values('cycleTimePerOneUnit(sec)')
-        for _, row in fallback.iterrows():
-            if row['stationName'] not in kb['fallback_rank']: kb['fallback_rank'][row['stationName']] = []
-            kb['fallback_rank'][row['stationName']].append({'name': row['operatorTeam'], 'speed': row['cycleTimePerOneUnit(sec)']})
-    return kb
 
 def run_optimizer(df, history_df=None):
-    brain = train_performance_model(history_df)
-    machine_clocks = {}
-    worker_clocks = {} # Track when workers are free
+    """
+    Phase 2: Machine-Centric Optimizer
+    Focuses on smart grouping, setup reduction, and predictable machine speeds.
+    """
     schedule = []
     
-    # Weekly Start: Next Monday 06:00
+    # 1. Identify their original columns dynamically
+    machine_col = next((c for c in df.columns if 'w/h' in str(c).lower() or 'machine' in str(c).lower()), None)
+    qty_col = next((c for c in df.columns if 'qty' in str(c).lower()), None)
+    desc_col = next((c for c in df.columns if 'description' in str(c).lower() or 'item' in str(c).lower()), None)
+    
+    # If we can't find standard columns, just return the dataframe safely
+    if not all([machine_col, qty_col, desc_col]):
+        print("Warning: Could not detect standard columns.")
+        return df
+
+    # --- THE MAGIC: SMART GROUPING ---
+    # Sorting by Machine, then by Description mathematically groups identical colors/finishes together
+    df[desc_col] = df[desc_col].astype(str).str.strip()
+    df = df.sort_values(by=[machine_col, desc_col]).reset_index(drop=True)
+
+    # Site & Production Line Translator
+    def get_line_info(row):
+        m_code = str(row[machine_col]).upper()
+        d_text = str(row[desc_col]).upper()
+        
+        site = "Unknown"
+        line = m_code
+        
+        # Boksburg
+        if 'BXB' in m_code:
+            site = 'Boksburg'
+            if 'FOIL' in d_text or 'AEB' in m_code: line = "FOIL LINE"
+            elif '321' in m_code: line = "MFB 2"
+            else: line = "MFB 1"
+        # Piet Retief
+        elif 'PRF' in m_code:
+            site = 'Piet Retief'
+            if 'CHIP' in d_text or '218' in m_code: line = "CHIP LINE"
+            else: line = "MFB LINE"
+        # Ugie
+        elif 'UGI' in m_code:
+            site = 'Ugie'
+            if 'CONTI' in d_text or '005' in m_code or '003' in m_code: line = "CONTI LINE"
+            else: line = "MFB LINE"
+            
+        return site, line
+
+    # Apply Site and Line logic
+    df[['Site', 'Production_Line']] = df.apply(get_line_info, axis=1, result_type="expand")
+
+    # --- TIMING & SETUP PENALTIES ---
+    # Start schedule Next Monday at 06:00 AM
     today = datetime.now()
     days_ahead = 0 - today.weekday()
     if days_ahead <= 0: days_ahead += 7 
     start_base = (today + timedelta(days=days_ahead)).replace(hour=6, minute=0, second=0, microsecond=0)
 
-    # Site Detection
-    def detect_site(row):
-        m, s = str(row.get('Machine', '')).upper(), str(row.get('Source_File', '')).upper()
-        if 'BXB' in s or 'BXB' in m: return 'Boksburg'
-        if 'PRF' in s or 'PRF' in m: return 'Piet Retief'
-        if 'UGI' in s or 'UGI' in m: return 'Ugie'
-        return 'Boksburg'
-
-    df['Site'] = df.apply(detect_site, axis=1)
-    df = df.sort_values(by=['Site', 'Machine']).reset_index(drop=True)
-
+    line_clocks = {} # Tracks the current time on each physical machine
+    
     for index, row in df.iterrows():
-        machine = str(row['Machine'])
-        product = str(row['Product'])
-        total_qty = row['Qty']
-
-        # 1. Resolve Machine
-        db_machine_name = resolve_machine_code(machine)
-
-        # 2. Get Standard Speed (needed for calculation)
-        calibrated_speed = 25
-        experts = brain['performance_rank'].get((db_machine_name, product), [])
-        if not experts: experts = brain['fallback_rank'].get(db_machine_name, [])
-        if experts: calibrated_speed = experts[0]['speed']
-
-        # --- BATCH SPLITTING ---
-        # If duration > 16 hours, split into smaller chunks
-        MAX_BATCH_HRS = 16
-        units_per_hr = (3600 / calibrated_speed)
-        max_qty_per_batch = int(units_per_hr * MAX_BATCH_HRS)
+        line = row['Production_Line']
+        qty = float(row[qty_col])
+        desc = row[desc_col]
         
-        # Calculate how many splits we need
-        num_splits = math.ceil(total_qty / max_qty_per_batch)
-        if num_splits == 0: num_splits = 1
+        if line not in line_clocks:
+            line_clocks[line] = start_base
+            
+        start_time = line_clocks[line]
+        setup_mins = 0
         
-        for i in range(num_splits):
-            # Calculate Qty for this sub-batch
-            qty_this_batch = min(max_qty_per_batch, total_qty - (i * max_qty_per_batch))
-            
-            # 3. Schedule Time
-            if machine not in machine_clocks: machine_clocks[machine] = start_base
-            start_time = machine_clocks[machine]
-            
-            # Setup Time (Only on first sub-batch if product changed)
-            if i == 0 and index > 0:
-                prev_row = df.iloc[index-1]
-                if prev_row['Machine'] == machine and prev_row['Product'] != product:
-                    start_time += timedelta(minutes=45)
-
-            # 4. Assign Worker (With Fatigue Buffer)
-            assigned_worker = "Standard Team"
-            found_worker = False
-            
-            if experts:
-                for expert in experts:
-                    w_name = expert['name']
-                    # Check if worker is free AND has rested (Fatigue Buffer)
-                    if worker_clocks.get(w_name, start_base) <= start_time:
-                        assigned_worker = w_name
-                        calibrated_speed = expert['speed'] # Update speed to expert speed
-                        found_worker = True
-                        break
-            
-            if not found_worker:
-                assigned_worker = f"Relief Team {df.iloc[index]['Site']}"
-                calibrated_speed = 30 # Slower
-
-            # Calculate Duration
-            duration_mins = max(15, int((qty_this_batch * calibrated_speed) / 60))
-            end_time = start_time + timedelta(minutes=duration_mins)
-
-            # Update Clocks
-            machine_clocks[machine] = end_time
-            if found_worker:
-                # Add 8 hours rest time to worker's clock so they aren't rebooked immediately
-                worker_clocks[assigned_worker] = end_time + timedelta(hours=8)
-
-            # Save Row
-            new_row = row.copy()
-            new_row['Qty'] = qty_this_batch
-            new_row['Assigned_Team'] = assigned_worker
-            
-            # --- NEW FIX: ADD HUMAN-READABLE PRODUCTION LINE ---
-            ig_code = str(row.get('I/G', '')).upper()
-            machine_code = str(row.get('Machine', '')).upper()
-            desc = str(row.get('Item Description', '')).upper()
-            
-            prod_line = "General Line"
-            
-            # Boksburg Lines
-            if 'BXB' in machine_code:
-                if 'AEB' in ig_code or 'FOIL' in desc: prod_line = "FOIL LINE"
-                elif 'BXB321' in machine_code: prod_line = "MFB_2 LINE"
-                else: prod_line = "MFB_1 LINE"
-            
-            # Piet Retief Lines
-            elif 'PRF' in machine_code:
-                if 'AAA' in ig_code or 'AAD' in ig_code: prod_line = "CHIP LINE"
-                elif 'ADA' in ig_code: prod_line = "MDF LINE"
-                else: prod_line = "MFB_1 LINE"
-            
-            # Ugie Lines
-            elif 'UGI' in machine_code:
-                if 'AAA' in ig_code: prod_line = "CONTI LINE"
-                else: prod_line = "GLS/TXT MFB LINE"
+        # Apply Setup Penalty: If the product description changes, add 30 mins for plate/paper change!
+        if index > 0:
+            prev_row = df.iloc[index-1]
+            if prev_row['Production_Line'] == line and prev_row[desc_col] != desc:
+                setup_mins = 30
+                start_time += timedelta(minutes=setup_mins)
                 
-            new_row['Production_Line'] = prod_line
-            # ---------------------------------------------------
-
-            new_row['Planned_Day'] = start_time.strftime("%A (%b %d)") 
-            new_row['Start_Time'] = start_time.strftime("%Y-%m-%d %H:%M")
-            new_row['End_Time'] = end_time.strftime("%Y-%m-%d %H:%M")
-            new_row['Time_Only'] = start_time.strftime("%H:%M") 
-            new_row['Duration_Mins'] = duration_mins
-            new_row['Shift'] = "Morning" if 6 <= start_time.hour < 14 else "Afternoon" if 14 <= start_time.hour < 22 else "Night"
-            
-            # Add suffix if split
-            if num_splits > 1:
-                new_row['Order_ID'] = f"{row.get('Order_ID', 'UNK')}-{i+1}"
-            
-            schedule.append(new_row)
+        # Calculate predictable run time (Assuming 120 units per hour baseline)
+        # 120 units/hr = 2 units per minute
+        run_time_mins = max(15, int((qty / 120) * 60))
+        
+        end_time = start_time + timedelta(minutes=run_time_mins)
+        
+        # Update the machine's clock
+        line_clocks[line] = end_time
+        
+        # Build the final row (preserves their original columns, appends ours)
+        new_row = row.copy()
+        new_row['Setup_Time_Mins'] = setup_mins
+        new_row['Run_Time_Mins'] = run_time_mins
+        new_row['Start_Time'] = start_time.strftime("%Y-%m-%d %H:%M")
+        new_row['End_Time'] = end_time.strftime("%Y-%m-%d %H:%M")
+        new_row['Planned_Day'] = start_time.strftime("%A (%b %d)")
+        
+        schedule.append(new_row)
 
     return pd.DataFrame(schedule)
