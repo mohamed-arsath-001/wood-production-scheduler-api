@@ -7,8 +7,6 @@ import io
 import requests
 import step1_ingest
 import step2_optimizer
-import xlsxwriter
-import os 
 import traceback
 
 app = FastAPI()
@@ -20,15 +18,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- LOAD MASTER DATABASE ---
-history_df = pd.DataFrame() 
-if os.path.exists("API Data.xlsx"):
-    try: history_df = pd.read_excel("API Data.xlsx")
-    except: pass
-elif os.path.exists("4. API Data.xlsx"):
-    try: history_df = pd.read_excel("4. API Data.xlsx")
-    except: pass
 
 @app.post("/optimize")
 async def optimize_schedule(files: List[UploadFile] = File(...)):
@@ -44,9 +33,8 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
                 else: df = pd.read_excel(io.BytesIO(content))
             except: continue 
 
-            # Step 1: Ingest & Clean
+            # Step 1: Ingest & Clean (Preserving exact format)
             cleaned_df = step1_ingest.standardize_columns(df)
-            cleaned_df['Source_File'] = filename 
             combined_data.append(cleaned_df)
 
         if not combined_data:
@@ -54,13 +42,18 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
 
         master_df = pd.concat(combined_data, ignore_index=True)
 
-        # Step 2: Run AI Optimizer
-        optimized_master = step2_optimizer.run_optimizer(master_df, history_df)
+        # Step 2: Run the new Machine-Centric Optimizer
+        optimized_master = step2_optimizer.run_optimizer(master_df)
 
-        # --- MOVE PRODUCTION LINE COLUMN TO THE FRONT ---
+        # --- ORGANIZE COLUMNS ---
+        # Put our new AI columns at the front, then all their original columns right after
         if 'Production_Line' in optimized_master.columns:
-            cols = ['Production_Line'] + [c for c in optimized_master.columns if c != 'Production_Line']
-            optimized_master = optimized_master[cols]
+            new_cols = ['Production_Line', 'Planned_Day', 'Start_Time', 'End_Time', 'Setup_Time_Mins', 'Run_Time_Mins']
+            existing_cols = [c for c in optimized_master.columns if c not in new_cols and c != 'Site']
+            
+            # Combine them into the final layout
+            final_cols = new_cols + existing_cols + ['Site']
+            optimized_master = optimized_master[final_cols]
 
         # --- STEP 3: CREATE MULTI-SHEET EXCEL FILE ---
         output = io.BytesIO()
@@ -68,10 +61,12 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             
             # TAB 1: DASHBOARD
             total_orders = len(optimized_master)
-            total_units = optimized_master['Qty'].sum() if 'Qty' in optimized_master else 0
+            # Find their quantity column dynamically to sum it up
+            qty_col = next((c for c in optimized_master.columns if 'qty' in str(c).lower()), None)
+            total_units = optimized_master[qty_col].sum() if qty_col else 0
             
             dashboard_data = [
-                {'Metric': 'ZESTFLOW PRODUCTION PLAN', 'Value': ''},
+                {'Metric': 'MASTER PRODUCTION PLAN', 'Value': ''},
                 {'Metric': '---------------------------', 'Value': '---'},
                 {'Metric': 'Total Orders', 'Value': total_orders},
                 {'Metric': 'Total Units', 'Value': total_units},
@@ -89,34 +84,23 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             # TAB 2: BOKSBURG
             if 'Site' in optimized_master.columns:
                 df_bxb = optimized_master[optimized_master['Site'] == 'Boksburg']
-                df_bxb.to_excel(writer, index=False, sheet_name='Boksburg')
+                if not df_bxb.empty: df_bxb.to_excel(writer, index=False, sheet_name='Boksburg')
 
             # TAB 3: PIET RETIEF
             if 'Site' in optimized_master.columns:
                 df_prf = optimized_master[optimized_master['Site'] == 'Piet Retief']
-                df_prf.to_excel(writer, index=False, sheet_name='Piet Retief')
+                if not df_prf.empty: df_prf.to_excel(writer, index=False, sheet_name='Piet Retief')
 
             # TAB 4: UGIE
             if 'Site' in optimized_master.columns:
                 df_ugi = optimized_master[optimized_master['Site'] == 'Ugie']
-                df_ugi.to_excel(writer, index=False, sheet_name='Ugie')
+                if not df_ugi.empty: df_ugi.to_excel(writer, index=False, sheet_name='Ugie')
 
         output.seek(0)
 
-        # --- STEP 4: SEND EXCEL TO N8N (EMAIL) ---
-        n8n_url = "https://arsath26.app.n8n.cloud/webhook/process-schedule"
-        files_payload = {'data': ('Production_Plan.xlsx', output.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
-        
-        try:
-            requests.post(n8n_url, files=files_payload)
-            print("✅ Excel file sent to N8N")
-        except Exception as e:
-            print(f"❌ Failed to send to N8N: {e}")
-
-        # --- STEP 5: DIRECT BROWSER DOWNLOAD ---
-        output.seek(0)
+        # --- STEP 4: DIRECT BROWSER DOWNLOAD ---
         headers = {
-            'Content-Disposition': 'attachment; filename="Production_Plan.xlsx"'
+            'Content-Disposition': 'attachment; filename="Optimized_Production_Plan.xlsx"'
         }
         return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
