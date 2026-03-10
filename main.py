@@ -4,7 +4,6 @@ from fastapi.responses import StreamingResponse
 from typing import List
 import pandas as pd
 import io
-import requests
 import step1_ingest
 import step2_optimizer
 import traceback
@@ -48,11 +47,17 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
         # --- ORGANIZE COLUMNS ---
         # Put our new AI columns at the front, then all their original columns right after
         if 'Production_Line' in optimized_master.columns:
-            new_cols = ['Production_Line', 'Planned_Day', 'Start_Time', 'End_Time', 'Setup_Time_Mins', 'Run_Time_Mins']
-            existing_cols = [c for c in optimized_master.columns if c not in new_cols and c != 'Site']
+            new_cols = ['Production_Line', 'Batch_ID', 'Planned_Day', 'Start_Time', 'End_Time', 'Setup_Time_Mins', 'Run_Time_Mins']
+            
+            # Ensure we only sort by columns that were successfully created
+            valid_new_cols = [c for c in new_cols if c in optimized_master.columns]
+            existing_cols = [c for c in optimized_master.columns if c not in valid_new_cols and c != 'Site']
             
             # Combine them into the final layout
-            final_cols = new_cols + existing_cols + ['Site']
+            final_cols = valid_new_cols + existing_cols
+            if 'Site' in optimized_master.columns:
+                final_cols.append('Site')
+                
             optimized_master = optimized_master[final_cols]
 
         # --- STEP 3: CREATE MULTI-SHEET EXCEL FILE ---
