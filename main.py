@@ -7,6 +7,7 @@ import io
 import step1_ingest
 import step2_optimizer
 import traceback
+from datetime import datetime
 
 app = FastAPI()
 
@@ -45,15 +46,12 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
         optimized_master = step2_optimizer.run_optimizer(master_df)
 
         # --- ORGANIZE COLUMNS ---
-        # Put our new AI columns at the front, then all their original columns right after
         if 'Production_Line' in optimized_master.columns:
             new_cols = ['Production_Line', 'Batch_ID', 'Planned_Day', 'Start_Time', 'End_Time', 'Setup_Time_Mins', 'Run_Time_Mins']
             
-            # Ensure we only sort by columns that were successfully created
             valid_new_cols = [c for c in new_cols if c in optimized_master.columns]
             existing_cols = [c for c in optimized_master.columns if c not in valid_new_cols and c != 'Site']
             
-            # Combine them into the final layout
             final_cols = valid_new_cols + existing_cols
             if 'Site' in optimized_master.columns:
                 final_cols.append('Site')
@@ -66,7 +64,6 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             
             # TAB 1: DASHBOARD
             total_orders = len(optimized_master)
-            # Find their quantity column dynamically to sum it up
             qty_col = next((c for c in optimized_master.columns if 'qty' in str(c).lower()), None)
             total_units = optimized_master[qty_col].sum() if qty_col else 0
             
@@ -103,9 +100,20 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
 
         output.seek(0)
 
-        # --- STEP 4: DIRECT BROWSER DOWNLOAD ---
+        # --- STEP 4: GENERATE DYNAMIC FILENAME & DOWNLOAD ---
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        file_name = f"plan [{current_date}].xlsx" # Default fallback
+        
+        if 'Site' in optimized_master.columns:
+            # Get a list of unique sites, ignoring empty/unknown ones if needed
+            unique_sites = [str(s) for s in optimized_master['Site'].dropna().unique() if str(s) != "Unknown"]
+            
+            if len(unique_sites) > 0:
+                sites_string = ", ".join(unique_sites)
+                file_name = f"plan({sites_string}) [{current_date}].xlsx"
+
         headers = {
-            'Content-Disposition': 'attachment; filename="Optimized_Production_Plan.xlsx"'
+            'Content-Disposition': f'attachment; filename="{file_name}"'
         }
         return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
