@@ -8,17 +8,18 @@ import step1_ingest
 import step2_optimizer
 import traceback
 from datetime import datetime
+import xlsxwriter
+from xlsxwriter.utility import xl_col_to_name
 
 app = FastAPI()
 
-# --- CORS SETTINGS (Updated to expose the filename to the frontend) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"] # Crucial for dynamic frontend downloads
+    expose_headers=["Content-Disposition"]
 )
 
 @app.post("/optimize")
@@ -35,7 +36,6 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
                 else: df = pd.read_excel(io.BytesIO(content))
             except: continue 
 
-            # Step 1: Ingest & Clean (Preserving exact format)
             cleaned_df = step1_ingest.standardize_columns(df)
             combined_data.append(cleaned_df)
 
@@ -43,8 +43,6 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             raise HTTPException(status_code=400, detail="No valid data found")
 
         master_df = pd.concat(combined_data, ignore_index=True)
-
-        # Step 2: Run the new Machine-Centric Optimizer
         optimized_master = step2_optimizer.run_optimizer(master_df)
 
         # --- ORGANIZE COLUMNS ---
@@ -60,14 +58,19 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
                 
             optimized_master = optimized_master[final_cols]
 
-        # --- STEP 3: CREATE MULTI-SHEET EXCEL FILE ---
+        # --- STEP 3: CREATE MULTI-SHEET EXCEL FILE WITH COLORS ---
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            workbook = writer.book
+            
+            # Define our custom colors
+            mega_order_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'}) # Red
+            setup_format = workbook.add_format({'bg_color': '#FFEB9C', 'font_color': '#9C6500'})      # Yellow
             
             # TAB 1: DASHBOARD
             total_orders = len(optimized_master)
-            qty_col = next((c for c in optimized_master.columns if 'qty' in str(c).lower()), None)
-            total_units = optimized_master[qty_col].sum() if qty_col else 0
+            qty_col_name = next((c for c in optimized_master.columns if 'qty' in str(c).lower() and 'actual' not in str(c).lower()), None)
+            total_units = optimized_master[qty_col_name].sum() if qty_col_name else 0
             
             dashboard_data = [
                 {'Metric': 'MASTER PRODUCTION PLAN', 'Value': ''},
@@ -85,31 +88,47 @@ async def optimize_schedule(files: List[UploadFile] = File(...)):
             
             pd.DataFrame(dashboard_data).to_excel(writer, index=False, sheet_name='Dashboard')
 
-            # TAB 2: BOKSBURG
-            if 'Site' in optimized_master.columns:
-                df_bxb = optimized_master[optimized_master['Site'] == 'Boksburg']
-                if not df_bxb.empty: df_bxb.to_excel(writer, index=False, sheet_name='Boksburg')
+            # TABS 2-4: FACTORY SHEETS WITH CONDITIONAL FORMATTING
+            sites = ['Boksburg', 'Piet Retief', 'Ugie']
+            for site in sites:
+                if 'Site' in optimized_master.columns:
+                    df_site = optimized_master[optimized_master['Site'] == site]
+                    if not df_site.empty:
+                        df_site.to_excel(writer, index=False, sheet_name=site)
+                        worksheet = writer.sheets[site]
+                        
+                        max_row = len(df_site)
+                        max_col = len(df_site.columns) - 1
+                        
+                        # Apply RED highlighting to Mega Orders (> 5000 units)
+                        if qty_col_name:
+                            qty_idx = df_site.columns.get_loc(qty_col_name)
+                            qty_letter = xl_col_to_name(qty_idx)
+                            
+                            worksheet.conditional_format(1, 0, max_row, max_col, {
+                                'type': 'formula',
+                                'criteria': f'=${qty_letter}2>=5000',
+                                'format': mega_order_format
+                            })
 
-            # TAB 3: PIET RETIEF
-            if 'Site' in optimized_master.columns:
-                df_prf = optimized_master[optimized_master['Site'] == 'Piet Retief']
-                if not df_prf.empty: df_prf.to_excel(writer, index=False, sheet_name='Piet Retief')
-
-            # TAB 4: UGIE
-            if 'Site' in optimized_master.columns:
-                df_ugi = optimized_master[optimized_master['Site'] == 'Ugie']
-                if not df_ugi.empty: df_ugi.to_excel(writer, index=False, sheet_name='Ugie')
+                        # Apply YELLOW highlighting just to the Setup Time cell if there is a 30 min penalty
+                        if 'Setup_Time_Mins' in df_site.columns:
+                            setup_idx = df_site.columns.get_loc('Setup_Time_Mins')
+                            worksheet.conditional_format(1, setup_idx, max_row, setup_idx, {
+                                'type': 'cell',
+                                'criteria': '>',
+                                'value': 0,
+                                'format': setup_format
+                            })
 
         output.seek(0)
 
         # --- STEP 4: GENERATE DYNAMIC FILENAME & DOWNLOAD ---
         current_date = datetime.now().strftime("%Y-%m-%d")
-        file_name = f"plan [{current_date}].xlsx" # Default fallback
+        file_name = f"plan [{current_date}].xlsx" 
         
         if 'Site' in optimized_master.columns:
-            # Get a list of unique sites, ignoring empty/unknown ones if needed
             unique_sites = [str(s) for s in optimized_master['Site'].dropna().unique() if str(s) != "Unknown"]
-            
             if len(unique_sites) > 0:
                 sites_string = ", ".join(unique_sites)
                 file_name = f"plan({sites_string}) [{current_date}].xlsx"
