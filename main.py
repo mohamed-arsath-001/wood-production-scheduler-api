@@ -11,12 +11,14 @@ from datetime import datetime
 
 app = FastAPI()
 
+# --- CORS SETTINGS (Updated to expose the filename to the frontend) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"] # Crucial for dynamic frontend downloads
 )
 
 @app.post("/optimize")
